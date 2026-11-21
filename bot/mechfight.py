@@ -29,6 +29,7 @@ import json
 import queue
 import sys
 import threading
+import time
 import traceback
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
@@ -495,18 +496,56 @@ def _send(msg: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def _reader(q: "queue.Queue[Optional[str]]") -> None:
+def _reader(q: "queue.Queue[Optional[tuple]]") -> None:
     for line in sys.stdin:
         if line.strip():
-            q.put(line)
+            q.put((time.perf_counter(), line))
     q.put(None)
 
 
-def run(make_bot: Any) -> None:
-    """Run a bot until the match ends. `make_bot(hello)` returns an object with `act(obs) -> Action`
-    and optionally `name`. A class works: `run(MyBot)`."""
-    q: "queue.Queue[Optional[str]]" = queue.Queue()
+# ---------------------------------------------------------------- one answer per tick, always on time
+_lock = threading.Lock()
+_answered: Dict[str, Any] = {"tick": None}
+_pending: Dict[str, Any] = {"tick": None, "deadline": 0.0, "fallback": None}
+
+
+def _answer(tick: Any, action: Dict[str, Any]) -> bool:
+    """Send the action for `tick` unless that tick was already answered (by the watchdog)."""
+    with _lock:
+        if _answered["tick"] == tick:
+            return False
+        _answered["tick"] = tick
+        try:
+            _send(action)
+        except (TypeError, ValueError):
+            log(f"unserializable action at tick {tick}: {traceback.format_exc()}")
+            _send({"tick": tick})
+        return True
+
+
+def _watchdog() -> None:
+    """If act() overruns, answer with the fallback before the server's budget runs out."""
+    while True:
+        time.sleep(0.002)
+        p = _pending
+        tick = p["tick"]
+        if tick is not None and time.perf_counter() > p["deadline"]:
+            fb = p["fallback"]
+            p["tick"] = None
+            if fb is not None:
+                _answer(tick, fb)
+
+
+def run(make_bot: Any, budget_s: float = 0.012, hard_s: float = 0.038) -> None:
+    """Run a bot until the match ends. `make_bot(hello)` returns an object with `act(obs, deadline)`
+    (deadline = perf_counter() time by which act should return) and optionally `fallback(obs, last)`."""
+    try:
+        sys.setswitchinterval(0.001)
+    except Exception:
+        pass
+    q: "queue.Queue[Optional[tuple]]" = queue.Queue()
     threading.Thread(target=_reader, args=(q,), daemon=True).start()
+    threading.Thread(target=_watchdog, daemon=True).start()
     bot = None
     last: Dict[str, Any] = {}
     errors = 0
@@ -518,12 +557,16 @@ def run(make_bot: Any) -> None:
             except queue.Empty:
                 break
         latest = None
-        for raw in batch:
-            if raw is None:
+        arrived = 0.0
+        for item in batch:
+            if item is None:
                 return
+            at, raw = item
             try:
                 msg = json.loads(raw)
             except ValueError:
+                continue
+            if not isinstance(msg, dict):
                 continue
             kind = msg.get("type")
             if kind == "hello":
@@ -533,33 +576,42 @@ def run(make_bot: Any) -> None:
                 except Exception:
                     log(traceback.format_exc())
                 name = getattr(bot, "name", None) or getattr(make_bot, "__name__", "bot")
-                _send({"type": "ready", "name": str(name)[:32]})
+                with _lock:
+                    _send({"type": "ready", "name": str(name)[:32]})
             elif kind == "obs":
-                latest = msg
+                latest, arrived = msg, at
             elif kind == "end":
                 return
         if latest is None:
             continue
+        tick = latest.get("tick")
+        fb: Dict[str, Any] = {"tick": tick, **last}
+        if bot is not None and hasattr(bot, "fallback"):
+            try:
+                fb = dict(bot.fallback(latest, last) or {})
+                fb["tick"] = tick
+            except Exception:
+                pass
+        _pending["fallback"] = fb
+        _pending["deadline"] = arrived + hard_s
+        _pending["tick"] = tick
         action: Dict[str, Any] = {}
         draw.clear()
         if bot is not None:
             try:
-                action = dict(bot.act(latest) or {})
+                action = dict(bot.act(latest, arrived + budget_s) or {})
                 last = {k: action[k] for k in _CONTINUOUS if k in action}
             except Exception:
                 errors += 1
                 if errors <= 5 or errors % 100 == 0:
-                    log(f"act() failed at tick {latest['tick']} ({errors} so far):\n{traceback.format_exc()}")
-                action = dict(last)
-        action["tick"] = latest["tick"]
+                    log(f"act() failed at tick {tick} ({errors} so far): {traceback.format_exc()}")
+                action = dict(fb)
+        _pending["tick"] = None
+        action["tick"] = tick
         d = draw.take()
         if d and "debug" not in action:
             action["debug"] = d
-        try:
-            _send(action)
-        except (TypeError, ValueError):  # something in the action isn't JSON
-            log(f"unserializable action at tick {latest['tick']}:\n{traceback.format_exc()}")
-            _send({"tick": latest["tick"], **last})
+        _answer(tick, action)
 
 
 if __name__ == "__main__":
